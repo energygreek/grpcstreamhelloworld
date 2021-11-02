@@ -1,29 +1,14 @@
-/*
- *
- * Copyright 2015 gRPC authors.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- */
-
+#include "helloworld.pb.h"
+#include <cstdio>
 #include <grpcpp/impl/codegen/status.h>
 #include <grpcpp/server.h>
-#include <unistd.h>
-#include <cstdio>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
+#include <unistd.h>
 
 #include <grpc/support/log.h>
 #include <grpcpp/grpcpp.h>
@@ -45,7 +30,7 @@ using helloworld::HelloReply;
 using helloworld::HelloRequest;
 
 class ServerImpl final {
- public:
+public:
   ~ServerImpl() {}
 
   void Shutdown() {
@@ -75,102 +60,175 @@ class ServerImpl final {
     HandleRpcs();
   }
 
- private:
-  class CallData {
-    int CONNECT = 0, READ = 1, WRITE = 2, FINISH = 3, DONE = 4;
-
-   public:
-    CallData(Greeter::AsyncService* service, ServerCompletionQueue* cq)
-        : service_(service), cq_(cq) {
-      stream =
-          new grpc::ServerAsyncReaderWriter< ::helloworld::HelloReply,
-                                             ::helloworld::HelloRequest>(&ctx_);
-      ctx_.AsyncNotifyWhenDone(&DONE);
-      service_->RequestSayHello(&ctx_, stream, cq_, cq_, &CONNECT);
-    }
-
-    void Proceed(int* status_, bool ok) {
-      if (status_ == &CONNECT) {
-        stream->Read(&request_, &READ);
-        return;
-      } else if (status_ == &READ) {
-        // ok false means stream writedone in peer, so begin reply
-        if (ok) {
-          std::cout << request_.name() << std::endl;
-          stream->Read(&request_, &READ);
-        } else {
-          std::cout << "Read done" << std::endl;
-          std::string reply("Reply ");
-          reply.append(std::to_string(serverwrite3times++));
-          reply_.set_message(reply);
-          stream->Write(reply_, &WRITE);
-        }
-        return;
-      } else if (status_ == &WRITE) {
-        if (serverwrite3times <= 2) {
-          std::string reply("Reply ");
-          reply.append(std::to_string(serverwrite3times++));
-          reply_.set_message(reply);
-          stream->Write(reply_, &WRITE);
-        } else {
-          stream->Finish(Status::OK, &FINISH);
-        }
-        return;
-      } else if (status_ == &DONE) {
-		// client disconnect or canceled
-        std::cout << "Call canceled: " << ctx_.IsCancelled() <<  std::endl;
-        return;
-      }
-      GPR_ASSERT(status_ == &FINISH);
-      std::cout << "Write done" << std::endl;
-      delete this;
-    }
-
-   private:
-    // The means of communication with the gRPC runtime for an asynchronous
-    // server.
-    Greeter::AsyncService* service_;
-    // The producer-consumer queue where for asynchronous server notifications.
-    ServerCompletionQueue* cq_;
-    // Context for the rpc, allowing to tweak aspects of it such as the use
-    // of compression, authentication, as well as to send metadata back to the
-    // client.
-    ServerContext ctx_;
-
-    grpc::ServerAsyncReaderWriter< ::helloworld::HelloReply,
-                                   ::helloworld::HelloRequest>* stream;
-
-    // What we get from the client.
-    HelloRequest request_;
-    // What we send back to the client.
-    HelloReply reply_;
-    int serverwrite3times = 0;
+private:
+  static constexpr int CONNECT = 0, READ = 1, WRITE = 2, FINISH = 3, DONE = 4;
+  class CallData;
+  struct Event {
+    Event(CallData *cd, int event) : cd(cd), event(event) {}
+    void Process(bool ok) { cd->Proceed(event, ok); };
+    CallData *cd;
+    int event;
+    bool pending = false;
   };
 
+  class CallData {
+  public:
+    CallData(Greeter::AsyncService *service, ServerCompletionQueue *cq,
+             ServerImpl *server)
+        : service_(service), cq_(cq), server(server) {
+      stream =
+          new grpc::ServerAsyncReaderWriter<::helloworld::HelloReply,
+                                            ::helloworld::HelloRequest>(&ctx_);
+      ctx_.AsyncNotifyWhenDone(&doneevent);
+      service_->RequestSayHello(&ctx_, stream, cq_, cq_, &connectevent);
+    }
+    void Proceed(int status_, bool ok) {
+      switch (status_) {
+      case CONNECT:
+        server->create_new_rpc();
+        stream->Read(&request_, &readevent);
+        break;
+      case READ:
+        if (ok) {
+          std::cout << request_.name() << std::endl;
+          stream->Read(&request_, &readevent);
+        } else {
+          // ok false means stream writedone in peer, so begin reply
+          std::cout << "Read done" << std::endl;
+
+          // send all to queue at one time, cq will handle these msg one by one
+          reply("reply1");
+          reply("reply2");
+          reply("reply3");
+          reply("reply4");
+          finish();
+        }
+        break;
+      case WRITE:
+        writeevent.pending=false;
+        if (!ok) {
+          _onwriteerror();
+        }else{
+          _onwrite();
+        }
+        break;
+      case DONE:
+        // client disconnect or canceled
+        std::cout << "Call canceled: " << ctx_.IsCancelled() << std::endl;
+        break;
+      default:
+        GPR_ASSERT(status_ == FINISH);
+        std::cout << "RPC Finish" << std::endl;
+        server->remove_finished_rpc(this);
+      }
+    }
+
+    void reply(std::string msg) {
+      std::unique_ptr<HelloReply> replymsg(new HelloReply);
+      replymsg->set_message(msg);
+      {
+        std::lock_guard<std::mutex> lk(mutex_queue);
+        send_queue.emplace(std::move(replymsg));
+      }
+
+      // invoke in case no tag in cq
+      _onwrite();
+    }
+
+    void finish() {
+      {
+        std::lock_guard<std::mutex> lk(mutex_queue);
+        send_queue.emplace(nullptr);
+      }
+      // invoke in case no tag in cq
+      _onwrite();
+    }
+
+  private:
+    void _onwrite() {
+      std::lock_guard<std::mutex> lk(mutex_write);
+      std::unique_ptr<HelloReply> reply;
+      {
+        std::lock_guard<std::mutex> lk(mutex_queue);
+        if (send_queue.empty() || writeevent.pending || finishevent.pending) {
+          return;
+        }
+        reply = std::move(send_queue.front());
+        send_queue.pop();
+      }
+
+      if (reply) {
+        writeevent.pending = true;
+        stream->Write(*reply, &writeevent);
+      } else {
+        finishevent.pending = true;
+        stream->Finish(Status::OK, &finishevent);
+      }
+    }
+
+    void _onwriteerror() {}
+    void _onreaderror() {}
+
+  private:
+    Greeter::AsyncService *service_;
+    ServerCompletionQueue *cq_;
+    ServerContext ctx_;
+
+    grpc::ServerAsyncReaderWriter<::helloworld::HelloReply,
+                                  ::helloworld::HelloRequest> *stream;
+
+    HelloRequest request_;
+    int serverwrite3times = 0;
+    ServerImpl *server;
+
+    std::mutex mutex_write;
+    std::mutex mutex_queue;
+    std::queue<std::unique_ptr<HelloReply>> send_queue;
+    // events
+    Event connectevent{this, CONNECT};
+    Event readevent{this, READ};
+    Event writeevent{this, WRITE};
+    Event finishevent{this, FINISH};
+    Event doneevent{this, DONE};
+  };
+
+private:
   void HandleRpcs() {
-    auto onlyone = new CallData(&service_, cq_.get());
-    void* tag;  // uniquely identifies a request.
+    create_new_rpc();
+    void *tag; // uniquely identifies a request.
     bool ok;
     while (true) {
-		// Next return if there's an event or when Shutdown
+      // Next return if there's an event or when Shutdown
       GPR_ASSERT(cq_->Next(&tag, &ok));
-      onlyone->Proceed(static_cast<int*>(tag), ok);
+      static_cast<Event *>(tag)->Process(ok);
     }
+  }
+
+  void remove_finished_rpc(CallData *p) {
+    if (calls.find(p) == calls.end()) {
+      std::cout << "Not find rpc" << std::endl;
+      return;
+    }
+    calls.erase(p);
+  }
+
+  void create_new_rpc() {
+    auto ptr = std::make_shared<CallData>(&service_, cq_.get(), this);
+    calls.insert({ptr.get(), ptr});
   }
 
   std::unique_ptr<ServerCompletionQueue> cq_;
   Greeter::AsyncService service_;
   std::unique_ptr<Server> server_;
+  std::map<CallData *, std::shared_ptr<CallData>> calls;
 };
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
   {
     ServerImpl server;
-    std::thread t([&server]() {
-      sleep(60);
-      server.Shutdown();
-    });
-    server.Run();
+    std::thread t([&server]() { server.Run(); });
+    sleep(6000);
+    server.Shutdown();
     t.join();
   }
   return 0;
