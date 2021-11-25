@@ -57,7 +57,17 @@ public:
     std::cout << "Server listening on " << server_address << std::endl;
 
     // Proceed to the server's main loop.
-    HandleRpcs();
+	std::vector<std::thread> threads;
+	for(int i=0;i<5;i++){
+    	threads.emplace_back([this]() { HandleRpcs(); });
+	}
+	for(auto &t:threads){
+		t.join();
+	}
+  }
+  void create_new_rpc() {
+    auto ptr = std::make_shared<CallData>(&service_, cq_.get(), this);
+    calls.insert({ptr.get(), ptr});
   }
 
 private:
@@ -95,13 +105,11 @@ private:
         } else {
           // ok false means stream writedone in peer, so begin reply
           std::cout << "Read done" << std::endl;
-
-          // send all to queue at one time, cq will handle these msg one by one
-          reply("reply1");
-          reply("reply2");
-          reply("reply3");
-          reply("reply4");
-          finish();
+		  reply("reply1");
+		  reply("reply2");
+		  reply("reply3");
+		  reply("reply4");
+		  finish();
         }
         break;
       case WRITE:
@@ -113,12 +121,16 @@ private:
         }
         break;
       case DONE:
-        // client disconnect or canceled
-        std::cout << "Call canceled: " << ctx_.IsCancelled() << std::endl;
+        // client normally finish or canceled
+		if(ctx_.IsCancelled()){ 
+        	std::cout << "Call canceled: " << std::endl;
+		}
         break;
       default:
-        GPR_ASSERT(status_ == FINISH);
-        std::cout << "RPC Finish" << std::endl;
+		
+        if(status_ != FINISH){
+        	std::cout << "RPC Finish status"<< status_ << "ok?" << ok << std::endl;
+		}
         server->remove_finished_rpc(this);
       }
     }
@@ -212,10 +224,6 @@ private:
     calls.erase(p);
   }
 
-  void create_new_rpc() {
-    auto ptr = std::make_shared<CallData>(&service_, cq_.get(), this);
-    calls.insert({ptr.get(), ptr});
-  }
 
   std::unique_ptr<ServerCompletionQueue> cq_;
   Greeter::AsyncService service_;
@@ -224,12 +232,12 @@ private:
 };
 
 int main(int argc, char **argv) {
-  {
     ServerImpl server;
-    std::thread t([&server]() { server.Run(); });
-    sleep(6000);
-    server.Shutdown();
-    t.join();
-  }
-  return 0;
+	server.Run(); 
+
+    std::thread t1([&server]() { 
+    	sleep(6000);
+    	server.Shutdown();
+	});
+	return 0;
 }
